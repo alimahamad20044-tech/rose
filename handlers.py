@@ -5135,6 +5135,10 @@ _BK_CHUNK_PAGES   = 150           # ژمارەی پەڕەی هەر chunk (کەم
 _BK_TRANS_CACHE: dict = {}   # {(book_id, page_num): "وەرگێڕاو"}  — memory cache
 _BK_TRANS_ON:    dict = {}   # {uid: set_of_book_ids}  — بۆ کامیان چالاکە
 
+# کۆتایی ڕستەی ڕاست: تەنها خاڵی تاک (نەک ...) و نیشانەکانی ئەرەبی/ئینگلیزی
+# بە ئەمەوە هێڵی "سەرچاوە..." وەک بەردەوامی سەیر دەکرێت، نەک کۆتای پاراگراف
+_BK_SENT_END = re.compile(r'(?<!\.)\.(?!\.)\s*$|[؟!?]\s*$')
+
 # ── FIX [BUG-BK3]: Kurdish Legacy Font Encoding Normalizer ──────────────────
 # زۆری PDF ی کوردی لە فۆنتی کۆن (Unikurd / IraqiW / AliWeb) نووسراوەن
 # ئەم فۆنتانە پیتی کوردی لە پۆزیشنی عەرەبی خستووەتەوە → pypdf ئەمانەی دەردەکات
@@ -5164,6 +5168,40 @@ def _bk_normalize_legacy_kurdish(text: str) -> str:
     for _old, _new in _BK_LEGACY_PAIRS:
         text = text.replace(_old, _new)
     return text
+
+
+def _bk_merge_lines(items: list) -> list:
+    """
+    هێڵە بڕاوەکانی PDF یەکدەکاتەوە بۆ پاراگرافی ڕاست.
+    هێڵێک کە کۆتایی ڕستەی ڕاستی هەیە (. ؟ ! ?) → کۆتای پاراگراف + جیاکەر.
+    هێڵی بەتاڵ → جیاکەری پاراگراف پاراستراوە.
+    بەکاردەهێنرێت هەم لە کاتی ingest (PDF) هەم لە کاتی display.
+    """
+    result: list[str] = []
+    buf = ""
+    for item in items:
+        if not item:
+            if buf:
+                result.append(buf)
+                buf = ""
+            result.append("")
+            continue
+        if not buf:
+            buf = item
+        elif _BK_SENT_END.search(buf):
+            result.append(buf)
+            result.append("")   # ← جیاکەری پاراگراف پاش کۆتایی ڕستە
+            buf = item
+        else:
+            buf += " " + item
+    if buf:
+        result.append(buf)
+    # سڕینەوەی خاڵەکانی بەتاڵی دووبارە
+    deduped: list[str] = []
+    for r in result:
+        if r or not (deduped and deduped[-1] == ""):
+            deduped.append(r)
+    return deduped
 
 
 def _bk_db() -> "_bk_sqlite.Connection":
@@ -5240,6 +5278,13 @@ def _bk_get_progress(user_id: int, book_id: int) -> int:
     return row["page_num"] if row else 1
 
 
+_BK_INDD      = re.compile(r'[\w\-]+\.indd\s+Page\s+\d+', re.IGNORECASE)
+_BK_USERCODE  = re.compile(r'\buser-[a-z0-9]+\b', re.IGNORECASE)
+_BK_FCODE     = re.compile(r'\bF-\d{3,}\b')
+_BK_TIMESTAMP = re.compile(r'\b\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s+[AP]M\b')
+_BK_PAGEONLY  = re.compile(r'^\s*[\d\s\-–—]+\s*$')
+
+
 def _bk_clean_page(text: str) -> str:
     """
     artifact و شتی زیادە لە تێکستی PDF دەسڕێتەوە.
@@ -5252,17 +5297,9 @@ def _bk_clean_page(text: str) -> str:
       ④ خێرا دووبارەبوونەوەی هەمان هێڵ (artifact ی سکانەر)
       ⑤ هێڵە دووباراوەکانی PDF لە یەک پاراگرافدا یەکدەکاتەوە
     """
-    import re as _re
-
     lines = text.split("\n")
     cleaned: list[str] = []
     seen: dict[str, int] = {}
-
-    _INDD     = _re.compile(r'[\w\-]+\.indd\s+Page\s+\d+', _re.IGNORECASE)
-    _USERCODE = _re.compile(r'\buser-[a-z0-9]+\b', _re.IGNORECASE)
-    _FCODE    = _re.compile(r'\bF-\d{3,}\b')
-    _TIMESTAMP= _re.compile(r'\b\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s+[AP]M\b')
-    _PAGEONLY = _re.compile(r'^\s*[\d\s\-–—]+\s*$')   # تەنیا ژمارە/خط
 
     for line in lines:
         s = line.strip()
@@ -5270,17 +5307,13 @@ def _bk_clean_page(text: str) -> str:
             cleaned.append("")
             continue
 
-        # ── artifact پشکنین ──────────────────────────────────────────────
-        if _INDD.search(s):       continue
-        if _USERCODE.search(s):   continue
-        if _FCODE.search(s):      continue
-        if _TIMESTAMP.search(s):  continue
-
-        # هێڵی کورتی تەنیا ژمارە (پەڕەی PDF خۆی)
-        if _PAGEONLY.match(s) and len(s) < 10:
+        if _BK_INDD.search(s):      continue
+        if _BK_USERCODE.search(s):  continue
+        if _BK_FCODE.search(s):     continue
+        if _BK_TIMESTAMP.search(s): continue
+        if _BK_PAGEONLY.match(s) and len(s) < 10:
             continue
 
-        # دووبارەبوونەوەی artifact: هەمان هێڵ بۆ ٢ جار ڕیکبکەوێت — skip
         key = s.lower()
         seen[key] = seen.get(key, 0) + 1
         if seen[key] > 1 and len(s) < 80:
@@ -5288,58 +5321,15 @@ def _bk_clean_page(text: str) -> str:
 
         cleaned.append(s)
 
-    # ── هێڵە بڕاوەکانی PDF یەکدەکاتەوە بۆ پاراگرافی ڕاست ──────────────────
-    # هێڵێک کە کۆتایی ڕستەی بۆ نییە → بەردەوامی هێڵی دواتر
-    # هێڵێک کە کۆتایی ڕستەی هەیە (.  ؟  !  ?) → کۆتای پاراگراف
-    _SENT_END = _re.compile(r'[.؟!?]\s*$')
-
-    result: list[str] = []
-    buf = ""
-    prev_blank = False
-
-    for item in cleaned:
-        if not item:
-            if buf:
-                result.append(buf)
-                buf = ""
-            if not prev_blank:
-                result.append("")
-            prev_blank = True
-            continue
-        prev_blank = False
-
-        if not buf:
-            buf = item
-        elif _SENT_END.search(buf):
-            result.append(buf)
-            buf = item
-        else:
-            buf += " " + item
-
-    if buf:
-        result.append(buf)
-
-    # سڕینەوەی خاڵەکانی بەتاڵی زیادە
-    final: list[str] = []
-    prev_was_blank = False
-    for r in result:
-        if not r:
-            if not prev_was_blank:
-                final.append("")
-            prev_was_blank = True
-        else:
-            final.append(r)
-            prev_was_blank = False
-
-    return "\n".join(final).strip()
+    # هێڵە بڕاوەکانی PDF → پاراگرافی ڕاست (dedup لە ناو helper)
+    merged = _bk_merge_lines(cleaned)
+    return "\n".join(merged).strip()
 
 
 def _bk_split_text(raw: str) -> list:
     """تێکستی درێژ دابەشدەکات بە پەڕەی مەعقوول."""
-    import re as _re
-    raw = _bk_clean_page(raw)            # ← پاکردنەوە + یەکخستنەوەی پاراگرافەکان
-    # پاراگرافەکان بە دوو (یان زیاتر) هێڵی بەتاڵ جیا دەبنەوە
-    paras = [p.strip() for p in _re.split(r'\n{2,}', raw) if p.strip()]
+    raw = _bk_clean_page(raw)
+    paras = [p.strip() for p in re.split(r'\n{2,}', raw) if p.strip()]
     pages, cur = [], ""
     for p in paras:
         if len(cur) + len(p) + 2 > _BK_CHARS:
@@ -6229,31 +6219,17 @@ def _bk_fmt_display(txt: str) -> str:
     تێکستی پاشەکەوتراو (کتێبی کۆن یان نوێ) پێش پیشاندان فۆرمات دەکات.
     هێڵە بڕاوەکانی PDF یەکدەکاتەوە — پاراگرافی ڕووناک و خوێندنەوەی ئاسانتر.
     """
-    import re as _re
-    _SENT_END = _re.compile(r'[.؟!?]\s*$')
+    # هەر block ی جیاکراو بە \n\n → هێڵەکانی ناوەکەی یەکدەکاتەوە بە _bk_merge_lines
+    all_lines: list[str] = []
+    for block in re.split(r'\n{2,}', txt.strip()):
+        block_lines = [l.strip() for l in block.split('\n') if l.strip()]
+        if not block_lines:
+            continue
+        merged = _bk_merge_lines(block_lines)
+        all_lines.extend(merged)
+        all_lines.append("")   # جیاکەری پاراگراف
 
-    paras: list[str] = []
-    buf = ""
-
-    for block in _re.split(r'\n{2,}', txt.strip()):
-        for line in block.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            if not buf:
-                buf = line
-            elif _SENT_END.search(buf):
-                paras.append(buf)
-                buf = line
-            else:
-                buf += " " + line
-        if buf:
-            paras.append(buf)
-            buf = ""
-
-    if buf:
-        paras.append(buf)
-
+    paras = [l for l in all_lines if l]
     return "\n\n".join(paras) if paras else txt
 
 
