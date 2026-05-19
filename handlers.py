@@ -5137,7 +5137,7 @@ _BK_TRANS_ON:    dict = {}   # {uid: set_of_book_ids}  — بۆ کامیان چ�
 
 # کۆتایی ڕستەی ڕاست: تەنها خاڵی تاک (نەک ...) و نیشانەکانی ئەرەبی/ئینگلیزی
 # بە ئەمەوە هێڵی "سەرچاوە..." وەک بەردەوامی سەیر دەکرێت، نەک کۆتای پاراگراف
-_BK_SENT_END = re.compile(r'(?<!\.)\.(?!\.)\s*$|[؟!?]\s*$')
+_BK_SENT_END = re.compile(r'(?<!\.)\.(?!\.)[)\]"»›”’]*\s*$|[؟!?…][)\]"»›”’]*\s*$')
 
 # ── FIX [BUG-BK3]: Kurdish Legacy Font Encoding Normalizer ──────────────────
 # زۆری PDF ی کوردی لە فۆنتی کۆن (Unikurd / IraqiW / AliWeb) نووسراوەن
@@ -5309,7 +5309,7 @@ def _bk_clean_page(text: str) -> str:
 
         if _BK_INDD.search(s):      continue
         if _BK_USERCODE.search(s):  continue
-        if _BK_FCODE.search(s):     continue
+        if _BK_FCODE.search(s) and len(s) < 15: continue
         if _BK_TIMESTAMP.search(s): continue
         if _BK_PAGEONLY.match(s) and len(s) < 10:
             continue
@@ -5337,8 +5337,13 @@ def _bk_split_text(raw: str) -> list:
                 pages.append(cur.strip())
                 cur = ""
             while len(p) > _BK_CHARS:
-                pages.append(p[:_BK_CHARS].strip())
-                p = p[_BK_CHARS:]
+                split_at = _BK_CHARS
+                while split_at > 0 and p[split_at] not in ' \n':
+                    split_at -= 1
+                if split_at == 0:
+                    split_at = _BK_CHARS
+                pages.append(p[:split_at].strip())
+                p = p[split_at:]
         cur += p + "\n\n"
     if cur.strip():
         pages.append(cur.strip())
@@ -6230,7 +6235,7 @@ def _bk_fmt_display(txt: str) -> str:
         all_lines.append("")   # جیاکەری پاراگراف
 
     paras = [l for l in all_lines if l]
-    return "\n\n".join(paras) if paras else txt
+    return "\n\n".join(paras) if paras else txt.strip()
 
 
 def _bk_build_reader(book_id: int, page_num: int, user_id: int,
