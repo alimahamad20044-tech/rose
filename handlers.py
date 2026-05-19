@@ -5126,6 +5126,9 @@ _BK_E_FOLDER = "5449759571614980920"   # 📁 فۆڵدەری داخراو
 _BK_E_OPEN   = "5870831975583454068"   # 📂 فۆڵدەری کراوە
 _BK_E_GLOBE  = "5399898266265475100"   # 🌍 جیهانی
 _BK_E_MOON   = "5231070734016607712"   # 🌙 عەرەبی
+_BK_E_LOCK   = "5451882625193718409"   # 🔒 قفڵکراو
+_BK_E_UNLOCK = "5445284980978621387"   # 🔓 کراوە
+_BK_E_PERSON = "5352578038317308359"   # 👤 دەستگەیشتن
 
 # ئیمۆجییەکانی هەڵبژاردن کاتی دروستکردنی بەشی نوێ: (emoji_id, label)
 _BK_SHELF_EMOJIS: list = [
@@ -5144,7 +5147,8 @@ _BK_WAIT: dict = {}      # {user_id: {"step": ..., "lang": ..., "title": ..., "_
 _BK_WAIT_TTL  = 600.0   # ١٠ خولەک — پاشان state خۆکار پاک دەکرێتەوە
 
 # ── state ی دروستکردنی بەشی نوێ ──
-_BK_SHELF_WAIT: dict = {}   # {uid: {"step":"name"|"emoji","name":str,"parent_id":int|None,"_ts":float}}
+_BK_SHELF_WAIT: dict  = {}   # {uid: {"step":"name"|"emoji","name":str,"parent_id":int|None,"_ts":float}}
+_BK_ACCESS_WAIT: dict = {}   # {uid: {"book_id":int,"msg_id":int,"_ts":float}}
 _BK_SHELF_PER  = 6           # کتێب لە هەر پەڕەی بەشێکدا
 _BK_CANCEL_EV = __import__("threading").Event()  # SIGINT/shutdown → set() دەکرێت
 
@@ -5270,6 +5274,14 @@ def _bk_init_db() -> None:
                 PRIMARY KEY (book_id, page_num, src_lang),
                 FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS book_access (
+                book_id    INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                granted_by INTEGER NOT NULL,
+                granted_at TEXT    NOT NULL DEFAULT '',
+                PRIMARY KEY (book_id, user_id),
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+            );
         """)
         # ── مایگرەیشن: ئەگەر book_progress کۆن بوو (بێ FK) دووبارە دروست بکە ──
         fk_check = c.execute(
@@ -5288,6 +5300,10 @@ def _bk_init_db() -> None:
                 INSERT INTO book_progress SELECT * FROM book_progress_old;
                 DROP TABLE book_progress_old;
             """)
+        # ── مایگرەیشن: ستوونی locked بۆ books ──────────────────────────────
+        cols = [r[1] for r in c.execute("PRAGMA table_info(books)").fetchall()]
+        if "locked" not in cols:
+            c.execute("ALTER TABLE books ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
 
 
 _bk_init_db()
@@ -5708,6 +5724,62 @@ def _bk_trans_db_save(book_id: int, page_num: int, src_lang: str, text: str) -> 
             (book_id, page_num, src_lang, text,
              _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         )
+
+
+# ── Lock / Access helpers ───────────────────────────────────────────────────
+
+def _bk_lock_toggle(book_id: int) -> bool:
+    """حالەتی قفڵی کتێب دەگۆڕێت — حالەتی نوێ (True=قفڵکراو) دەگەڕێنێتەوە."""
+    with _bk_db() as c:
+        c.execute(
+            "UPDATE books SET locked = CASE WHEN locked=1 THEN 0 ELSE 1 END WHERE id=?",
+            (book_id,)
+        )
+        row = c.execute("SELECT locked FROM books WHERE id=?", (book_id,)).fetchone()
+    return bool(row["locked"]) if row else False
+
+
+def _bk_is_locked(book_id: int) -> bool:
+    with _bk_db() as c:
+        row = c.execute("SELECT locked FROM books WHERE id=?", (book_id,)).fetchone()
+    return bool(row["locked"]) if row else False
+
+
+def _bk_has_access(book_id: int, user_id: int) -> bool:
+    """True ئەگەر بەکارهێنەرەکە مافی خوێندنەوەی هەیە."""
+    if user_id == OWNER_ID:
+        return True
+    with _bk_db() as c:
+        row = c.execute("SELECT locked FROM books WHERE id=?", (book_id,)).fetchone()
+        if not row or not row["locked"]:
+            return True
+        acc = c.execute(
+            "SELECT 1 FROM book_access WHERE book_id=? AND user_id=?",
+            (book_id, user_id)
+        ).fetchone()
+    return acc is not None
+
+
+def _bk_access_list(book_id: int) -> list:
+    with _bk_db() as c:
+        return c.execute(
+            "SELECT user_id, granted_at FROM book_access WHERE book_id=? ORDER BY granted_at",
+            (book_id,)
+        ).fetchall()
+
+
+def _bk_access_grant(book_id: int, user_id: int, granted_by: int) -> None:
+    import datetime as _dt2
+    with _bk_db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO book_access (book_id, user_id, granted_by, granted_at) VALUES (?,?,?,?)",
+            (book_id, user_id, granted_by, _dt2.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+
+
+def _bk_access_revoke(book_id: int, user_id: int) -> None:
+    with _bk_db() as c:
+        c.execute("DELETE FROM book_access WHERE book_id=? AND user_id=?", (book_id, user_id))
 
 
 _BK_INDD      = re.compile(r'[\w\-]+\.indd\s+Page\s+\d+', re.IGNORECASE)
@@ -6691,12 +6763,31 @@ def _bk_build_reader(book_id: int, page_num: int, user_id: int,
     """پەڕەی خوێندنەوە دروست دەکات."""
     with _bk_db() as c:
         book = c.execute(
-            "SELECT title, author, language, total_pages FROM books WHERE id=?",
+            "SELECT title, author, language, total_pages, locked FROM books WHERE id=?",
             (book_id,)
         ).fetchone()
 
     if not book:
         return "<tg-emoji emoji-id='6271611232457855630'>❌</tg-emoji> کتێبەکە نەدۆزرایەوە.", InlineKeyboardMarkup([])
+
+    is_locked = bool(book["locked"])
+    is_owner  = (user_id == OWNER_ID)
+
+    # ── پشکنینی دەستگەیشتن ──────────────────────────────────────────────────
+    if is_locked and not is_owner:
+        if not _bk_has_access(book_id, user_id):
+            title_s = (book["title"][:28] + "…") if len(book["title"]) > 30 else book["title"]
+            locked_msg = (
+                f'🔒 <b>{html.escape(title_s)}</b>\n\n'
+                f'ئەم کتێبە قفڵکراوە.\n'
+                f'تەنها بەکارهێنەرانی دیاریکراو دەیخوێننەوە.\n\n'
+                f'<i>بۆ دەستگەیشتن پەیوەندی بکە بە بەڕێوەبەرەکەوە.</i>'
+            )
+            kb = InlineKeyboardMarkup([[
+                _ebtn("گەڕانەوە", "bk_list:0", emoji_id=_BK_E_BACK,
+                      api_kwargs={"style": "primary"})
+            ]])
+            return locked_msg, kb
 
     total    = book["total_pages"]
     page_num = max(1, min(page_num, total))
@@ -6790,13 +6881,156 @@ def _bk_build_reader(book_id: int, page_num: int, user_id: int,
 
     rows.append([_ebtn("زیادکردن بۆ بەش", f"bk_shelf_addbookto:{book_id}:0",
                         emoji_id=_BK_E_SHELF, api_kwargs={"style": "success"})])
+
+    # ── دووگمەکانی بەڕێوەبەر ── (تەنها OWNER_ID)
+    if is_owner:
+        if is_locked:
+            lock_row = [
+                _ebtn("🔓 کراوەکردن", f"bk_lock:{book_id}",
+                      api_kwargs={"style": "success"}),
+                _ebtn("👥 دەستگەیشتن", f"bk_access:{book_id}",
+                      api_kwargs={"style": "primary"}),
+            ]
+        else:
+            lock_row = [
+                _ebtn("🔒 قفڵکردن", f"bk_lock:{book_id}",
+                      api_kwargs={"style": "danger"}),
+            ]
+        rows.append(lock_row)
+
     bottom = [_ebtn("لیستی کتێب", "bk_list:0", emoji_id=_BK_E_LIST,
                     api_kwargs={"style": "primary"})]
-    if user_id == OWNER_ID:
+    if is_owner:
         bottom.append(_ebtn("سڕینەوە", f"bk_del_confirm:{book_id}",
                             emoji_id=_BK_E_DEL, api_kwargs={"style": "danger"}))
     rows.append(bottom)
     return text_msg, InlineKeyboardMarkup(rows)
+
+
+def _bk_build_access_list(book_id: int) -> tuple:
+    """UI ی بەڕێوەبردنی دەستگەیشتن بۆ یەک کتێب دروست دەکات."""
+    with _bk_db() as c:
+        book = c.execute("SELECT title, locked FROM books WHERE id=?", (book_id,)).fetchone()
+    if not book:
+        return "❌ کتێبەکە نەدۆزرایەوە.", InlineKeyboardMarkup([])
+
+    title_s = (book["title"][:28] + "…") if len(book["title"]) > 30 else book["title"]
+    is_locked = bool(book["locked"])
+    users = _bk_access_list(book_id)
+
+    lock_status = "🔒 قفڵکراوە" if is_locked else "🔓 کراوەیە"
+    header = (
+        f'<b>👥 دەستگەیشتن بەڕێوەبردن</b>\n'
+        f'📖 {html.escape(title_s)}\n'
+        f'حالەت: {lock_status}\n\n'
+    )
+    if users:
+        header += f'بەکارهێنەرانی مافدار ({len(users)} کەس):\n'
+        for row in users:
+            header += f'• <code>{row["user_id"]}</code>  —  <i>{row["granted_at"][:10]}</i>\n'
+    else:
+        header += '<i>هیچ بەکارهێنەرێک زیاد نەکراوە.</i>\n'
+
+    rows = []
+    for row in users:
+        rows.append([_ebtn(
+            f"❌ لابردنی {row['user_id']}",
+            f"bk_access_rm:{book_id}:{row['user_id']}",
+            api_kwargs={"style": "danger"}
+        )])
+    rows.append([_ebtn("➕ زیادکردنی بەکارهێنەر", f"bk_access_add:{book_id}",
+                       api_kwargs={"style": "success"})])
+    rows.append([_ebtn("گەڕانەوە بۆ کتێب", f"bk_read:{book_id}:1",
+                       emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"})])
+    return header, InlineKeyboardMarkup(rows)
+
+
+async def _bk_lock_callback(query, context):
+    """قفڵکردن/کراوەکردنی کتێب — تەنها OWNER_ID."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ تەنها بەڕێوەبەر.", show_alert=True)
+        return
+    try:
+        book_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    new_state = await loop.run_in_executor(None, _bk_lock_toggle, book_id)
+    state_txt = "🔒 قفڵکرا" if new_state else "🔓 کراوەکرا"
+    await query.answer(state_txt, show_alert=False)
+
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_reader, book_id, 1, query.from_user.id, "", False
+    )
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_access_callback(query, context):
+    """نیشاندانی لیستی دەستگەیشتن — تەنها OWNER_ID."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ تەنها بەڕێوەبەر.", show_alert=True)
+        return
+    try:
+        book_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    text, kb = await loop.run_in_executor(None, _bk_build_access_list, book_id)
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_access_add_callback(query, context):
+    """دەستپێکردنی زیادکردنی بەکارهێنەر — پرسیاری ID."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ تەنها بەڕێوەبەر.", show_alert=True)
+        return
+    try:
+        book_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True)
+        return
+
+    import time as _bk_at
+    _BK_ACCESS_WAIT[OWNER_ID] = {
+        "book_id": book_id,
+        "msg_id": query.message.message_id if query.message else None,
+        "_ts": _bk_at.monotonic()
+    }
+    await query.answer()
+    try:
+        await query.message.reply_text(
+            "📝 <b>ناسنامەی تێلێگرامی بەکارهێنەرەکە بنووسە</b>\n"
+            "<i>(تەنها ژمارەی ID — بۆ نموونە: <code>123456789</code>)</i>\n\n"
+            "دووگمەی /cancel بنووسە بۆ هەڵوەشاندنەوە.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+async def _bk_access_rm_callback(query, context):
+    """لابردنی دەستگەیشتنی بەکارهێنەرێک — تەنها OWNER_ID."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔ تەنها بەڕێوەبەر.", show_alert=True)
+        return
+    parts = query.data.split(":")
+    try:
+        book_id = int(parts[1])
+        uid     = int(parts[2])
+    except (IndexError, ValueError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _bk_access_revoke, book_id, uid)
+    await query.answer(f"✅ بەکارهێنەری {uid} لابرا", show_alert=False)
+
+    text, kb = await loop.run_in_executor(None, _bk_build_access_list, book_id)
+    await _safe_edit(query, text, reply_markup=kb)
 
 
 async def _bk_list_callback(query, context):
@@ -7314,6 +7548,12 @@ async def book_callback(update, context):
     elif data.startswith("bk_del_confirm:"):       await _bk_del_confirm_callback(query, context)
     elif data.startswith("bk_del:"):               await _bk_del_callback(query, context)
     elif data.startswith("bk_chunk:"):             await _bk_chunk_continue_callback(query, context)
+    # ── Lock / Access System ────────────────────────────────────────────────
+    elif data.startswith("bk_lock:"):              await _bk_lock_callback(query, context)
+    elif data.startswith("bk_access:"):            await _bk_access_callback(query, context)
+    elif data.startswith("bk_access_add:"):        await _bk_access_add_callback(query, context)
+    elif data.startswith("bk_access_rm:"):         await _bk_access_rm_callback(query, context)
+    # ────────────────────────────────────────────────────────────────────────
     # ── Shelf System ────────────────────────────────────────────────────────
     elif data.startswith("bk_shelves"):            await _bk_shelves_callback(query, context)
     elif data.startswith("bk_shelf:"):             await _bk_shelf_callback(query, context)
@@ -7366,6 +7606,40 @@ async def bk_message_handler(update, context):
     uid     = user.id
     chat_id = msg.chat_id
     state   = _BK_WAIT.get(uid)
+
+    # ══ ناسنامەی بەکارهێنەر بۆ دەستگەیشتن (OWNER_ID تەنها) ══════════════════
+    access_state = _BK_ACCESS_WAIT.get(uid)
+    if access_state and uid == OWNER_ID:
+        import time as _bk_ac
+        if _bk_ac.monotonic() - access_state["_ts"] > 300.0:
+            _BK_ACCESS_WAIT.pop(uid, None)
+        elif msg.text:
+            raw_id = msg.text.strip()
+            if raw_id.lower() == "/cancel":
+                _BK_ACCESS_WAIT.pop(uid, None)
+                await msg.reply_text("❌ هەڵوەشێنرایەوە.", parse_mode="HTML")
+                return
+            try:
+                target_uid = int(raw_id)
+            except ValueError:
+                await msg.reply_text(
+                    "⚠️ ناسنامەی نادروست. تەنها ژمارەی Telegram ID بنووسە.\n"
+                    "بۆ نموونە: <code>123456789</code>",
+                    parse_mode="HTML"
+                )
+                return
+            book_id = access_state["book_id"]
+            _BK_ACCESS_WAIT.pop(uid, None)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _bk_access_grant, book_id, target_uid, uid)
+            await msg.reply_text(
+                f"✅ دەستگەیشتنی بەکارهێنەری <code>{target_uid}</code> زیادکرا.",
+                parse_mode="HTML"
+            )
+            # لیستی نوێکراوە نیشان بدە
+            text, kb = await loop.run_in_executor(None, _bk_build_access_list, book_id)
+            await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+            return
 
     # ══ ناوی بەشی نوێ ════════════════════════════════════════════════════════
     shelf_state = _BK_SHELF_WAIT.get(uid)
