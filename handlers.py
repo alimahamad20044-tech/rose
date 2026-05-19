@@ -5261,6 +5261,15 @@ def _bk_init_db() -> None:
                 PRIMARY KEY (user_id, book_id),
                 FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS book_translations (
+                book_id    INTEGER NOT NULL,
+                page_num   INTEGER NOT NULL,
+                src_lang   TEXT    NOT NULL,
+                text       TEXT    NOT NULL,
+                created_at TEXT    NOT NULL DEFAULT '',
+                PRIMARY KEY (book_id, page_num, src_lang),
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+            );
         """)
         # ── مایگرەیشن: ئەگەر book_progress کۆن بوو (بێ FK) دووبارە دروست بکە ──
         fk_check = c.execute(
@@ -5676,6 +5685,29 @@ def _bk_get_progress(user_id: int, book_id: int) -> int:
             (user_id, book_id)
         ).fetchone()
     return row["page_num"] if row else 1
+
+
+def _bk_trans_db_get(book_id: int, page_num: int, src_lang: str) -> str | None:
+    """وەرگێڕانی پاشەکەوتکراو لە DB دەگەڕێنێتەوە، یان None ئەگەر نەبوو."""
+    with _bk_db() as c:
+        row = c.execute(
+            "SELECT text FROM book_translations WHERE book_id=? AND page_num=? AND src_lang=?",
+            (book_id, page_num, src_lang)
+        ).fetchone()
+    return row["text"] if row else None
+
+
+def _bk_trans_db_save(book_id: int, page_num: int, src_lang: str, text: str) -> None:
+    """وەرگێڕانەکە بە بەردەوامی لە DB پاشەکەوت دەکات."""
+    import datetime as _dt
+    with _bk_db() as c:
+        c.execute(
+            """INSERT OR REPLACE INTO book_translations
+               (book_id, page_num, src_lang, text, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (book_id, page_num, src_lang, text,
+             _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        )
 
 
 _BK_INDD      = re.compile(r'[\w\-]+\.indd\s+Page\s+\d+', re.IGNORECASE)
@@ -6390,8 +6422,19 @@ async def _bk_translate_page(book_id: int, page_num: int, text: str,
     import urllib.parse as _up
 
     cache_key = (book_id, page_num, src_lang)
+
+    # ١. RAM cache
     if cache_key in _BK_TRANS_CACHE:
         return _BK_TRANS_CACHE[cache_key]
+
+    # ٢. DB cache — وەرگێڕانی پاشەکەوتکراو
+    loop = asyncio.get_running_loop()
+    _db_hit = await loop.run_in_executor(
+        None, _bk_trans_db_get, book_id, page_num, src_lang
+    )
+    if _db_hit:
+        _BK_TRANS_CACHE[cache_key] = _db_hit   # گەڕاندنەوەبۆ RAM
+        return _db_hit
 
     # ── ناوەکانی زمان بۆ prompt ──────────────────────────────────────────────
     _LANG_NAMES = {
@@ -6546,6 +6589,10 @@ async def _bk_translate_page(book_id: int, page_num: int, text: str,
 
     if result:
         _BK_TRANS_CACHE[cache_key] = result
+        # پاشەکەوتکردنی بەردەوام بۆ DB — هەموو بەکارهێنەرەکان سوود لێدەبینن
+        await loop.run_in_executor(
+            None, _bk_trans_db_save, book_id, page_num, src_lang, result
+        )
     return result
 
 
@@ -6787,39 +6834,33 @@ async def _bk_read_callback(query, context):
     trans_on  = book_id in _BK_TRANS_ON.get(user_id, set())
     trans_text = ""
     if trans_on:
-        # cache بپشکنە — ئەگەر نەبوو وەرگێڕ
-        cache_key = (book_id, page_num)
-        if cache_key in _BK_TRANS_CACHE:
-            trans_text = _BK_TRANS_CACHE[cache_key]
-        else:
-            # پیامی چاوەڕوانی بنێرە
-            try:
-                await query.answer(
-                    "<tg-emoji emoji-id=\"5395758123950576680\">🌐</tg-emoji> وەرگێڕان دەکرێت…", show_alert=False
-                )
-            except Exception:
-                pass
-            # تێکستی پەڕە بخوێنەوە (sync)
-            def _get_page_text():
-                with _bk_db() as c:
-                    row = c.execute(
-                        "SELECT text FROM book_pages WHERE book_id=? AND page_num=?",
-                        (book_id, page_num)
-                    ).fetchone()
-                return row["text"] if row else ""
-            raw_text = await loop.run_in_executor(None, _get_page_text)
-            if raw_text:
-                # زمانی کتێب دۆزە بکەوە بۆ وەرگێڕانی ڕاست
-                def _get_book_lang():
-                    with _bk_db() as _c:
-                        _r = _c.execute(
-                            "SELECT language FROM books WHERE id=?", (book_id,)
-                        ).fetchone()
-                    return _r["language"] if _r else "en"
-                _bk_src_lang = await loop.run_in_executor(None, _get_book_lang)
-                trans_text = await _bk_translate_page(
-                    book_id, page_num, raw_text, src_lang=_bk_src_lang
-                )
+        # زمان و تێکستی پەڕە یەک جار بخوێنەوە
+        def _get_bk_data():
+            with _bk_db() as _c:
+                _r = _c.execute(
+                    "SELECT language FROM books WHERE id=?", (book_id,)
+                ).fetchone()
+                _p = _c.execute(
+                    "SELECT text FROM book_pages WHERE book_id=? AND page_num=?",
+                    (book_id, page_num)
+                ).fetchone()
+            return (_r["language"] if _r else "en"), (_p["text"] if _p else "")
+        _bk_src_lang, raw_text = await loop.run_in_executor(None, _get_bk_data)
+        if raw_text:
+            cache_key = (book_id, page_num, _bk_src_lang)
+            # ئەگەر نە RAM-دا — پیامی "وەرگێڕان دەکرێت" پیشان بدە (DB یان API دێت)
+            if cache_key not in _BK_TRANS_CACHE:
+                try:
+                    await query.answer(
+                        "<tg-emoji emoji-id=\"5395758123950576680\">🌐</tg-emoji> وەرگێڕان دەکرێت…",
+                        show_alert=False
+                    )
+                except Exception:
+                    pass
+            # _bk_translate_page: RAM → DB → API
+            trans_text = await _bk_translate_page(
+                book_id, page_num, raw_text, src_lang=_bk_src_lang
+            )
 
     text, kb = await loop.run_in_executor(
         None, _bk_build_reader, book_id, page_num, user_id, trans_text, trans_on
@@ -6857,27 +6898,24 @@ async def _bk_trans_callback(query, context):
             await query.answer("🌐 وەرگێڕان دەکرێت…", show_alert=False)
         except Exception:
             pass
-        # پەڕەی ئێستا وەرگێڕ
-        cache_key = (book_id, page_num)
-        if cache_key not in _BK_TRANS_CACHE:
-            def _get_txt():
-                with _bk_db() as _c2:
-                    r = _c2.execute(
-                        "SELECT text FROM book_pages WHERE book_id=? AND page_num=?",
-                        (book_id, page_num)
-                    ).fetchone()
-                return r["text"] if r else ""
-            def _get_lang():
-                with _bk_db() as _c3:
-                    _rl = _c3.execute(
-                        "SELECT language FROM books WHERE id=?", (book_id,)
-                    ).fetchone()
-                return _rl["language"] if _rl else "en"
-            raw  = await loop.run_in_executor(None, _get_txt)
-            _sl  = await loop.run_in_executor(None, _get_lang)
-            if raw:
-                await _bk_translate_page(book_id, page_num, raw, src_lang=_sl)
-        trans_text = _BK_TRANS_CACHE.get(cache_key, "")
+        # پەڕەی ئێستا وەرگێڕ — زمان و تێکست یەک جار بخوێنەوە
+        def _get_bk_data_trans():
+            with _bk_db() as _c2:
+                _r = _c2.execute(
+                    "SELECT language FROM books WHERE id=?", (book_id,)
+                ).fetchone()
+                _p = _c2.execute(
+                    "SELECT text FROM book_pages WHERE book_id=? AND page_num=?",
+                    (book_id, page_num)
+                ).fetchone()
+            return (_r["language"] if _r else "en"), (_p["text"] if _p else "")
+        _sl, raw = await loop.run_in_executor(None, _get_bk_data_trans)
+        cache_key = (book_id, page_num, _sl)
+        if raw:
+            # _bk_translate_page: RAM → DB → API
+            trans_text = await _bk_translate_page(book_id, page_num, raw, src_lang=_sl)
+        else:
+            trans_text = _BK_TRANS_CACHE.get(cache_key, "")
     else:
         _BK_TRANS_ON[user_id].discard(book_id)
         trans_text = ""
