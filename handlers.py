@@ -5120,9 +5120,32 @@ _BK_E_BACK   = "5352759161945867747"   # گەڕانەوە
 _BK_E_STAR   = "5379553354076694057"   # <tg-emoji emoji-id='5379553354076694057'>⭐</tg-emoji>
 _BK_E_MOSQUE = "5382295780889498241"   # <tg-emoji emoji-id='5382295780889498241'>🕌</tg-emoji>
 
+# ── ئایدی ئیمۆجییەکانی بەشەکان (Shelf System) ──────────────────────────────
+_BK_E_SHELF  = "5307546645430478677"   # 📚 کتێبخانە / بەش
+_BK_E_FOLDER = "5449759571614980920"   # 📁 فۆڵدەری داخراو
+_BK_E_OPEN   = "5870831975583454068"   # 📂 فۆڵدەری کراوە
+_BK_E_GLOBE  = "5399898266265475100"   # 🌍 جیهانی
+_BK_E_MOON   = "5231070734016607712"   # 🌙 عەرەبی
+
+# ئیمۆجییەکانی هەڵبژاردن کاتی دروستکردنی بەشی نوێ: (emoji_id, label)
+_BK_SHELF_EMOJIS: list = [
+    (_BK_E_SHELF,  "📚"),
+    (_BK_E_BOOK,   "📖"),
+    (_BK_E_FOLDER, "📁"),
+    (_BK_E_STAR,   "⭐"),
+    (_BK_E_MOSQUE, "🕌"),
+    (_BK_E_MOON,   "🌙"),
+    (_BK_E_GLOBE,  "🌍"),
+    (_BK_E_LIST,   "📋"),
+]
+
 # ── پیتە کوردییە تایبەتەکان — بۆ پشکنینی زمانی تێکست ──
 _BK_WAIT: dict = {}      # {user_id: {"step": ..., "lang": ..., "title": ..., "_ts": float}}
 _BK_WAIT_TTL  = 600.0   # ١٠ خولەک — پاشان state خۆکار پاک دەکرێتەوە
+
+# ── state ی دروستکردنی بەشی نوێ ──
+_BK_SHELF_WAIT: dict = {}   # {uid: {"step":"name"|"emoji","name":str,"parent_id":int|None,"_ts":float}}
+_BK_SHELF_PER  = 6           # کتێب لە هەر پەڕەی بەشێکدا
 _BK_CANCEL_EV = __import__("threading").Event()  # SIGINT/shutdown → set() دەکرێت
 
 # ── Chunk Processing — بۆ PDF ی گەورە (زیاتر لە TRIGGER پەڕە) ──────────────
@@ -5259,6 +5282,383 @@ def _bk_init_db() -> None:
 
 
 _bk_init_db()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  📚 سیستەمی بەشەکان  —  Shelf / Category System  v1.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _bk_shelf_init() -> None:
+    """جەدوەلەکانی بەشەکان دروست دەکات ئەگەر نەبوون."""
+    with _bk_db() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS book_shelves (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL,
+                parent_id  INTEGER,
+                emoji_id   TEXT    NOT NULL DEFAULT '5449759571614980920',
+                created_by INTEGER NOT NULL,
+                created_at TEXT    NOT NULL,
+                FOREIGN KEY (parent_id) REFERENCES book_shelves(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS book_shelf_members (
+                shelf_id INTEGER NOT NULL,
+                book_id  INTEGER NOT NULL,
+                PRIMARY KEY (shelf_id, book_id),
+                FOREIGN KEY (shelf_id) REFERENCES book_shelves(id) ON DELETE CASCADE,
+                FOREIGN KEY (book_id)  REFERENCES books(id)         ON DELETE CASCADE
+            );
+        """)
+
+
+_bk_shelf_init()
+
+
+def _bk_shelf_get(shelf_id: int):
+    """زانیاری یەک بەش."""
+    with _bk_db() as c:
+        return c.execute(
+            "SELECT id, name, parent_id, emoji_id FROM book_shelves WHERE id=?",
+            (shelf_id,)
+        ).fetchone()
+
+
+def _bk_shelf_children(parent_id) -> list:
+    """ژێربەشەکانی parent_id (None = ئاستی سەرەوە)."""
+    with _bk_db() as c:
+        return c.execute(
+            "SELECT s.id, s.name, s.emoji_id, "
+            "  COUNT(DISTINCT m.book_id) AS book_count, "
+            "  COUNT(DISTINCT c.id)      AS child_count "
+            "FROM book_shelves s "
+            "LEFT JOIN book_shelf_members m ON m.shelf_id = s.id "
+            "LEFT JOIN book_shelves c ON c.parent_id = s.id "
+            "WHERE s.parent_id IS ? "
+            "GROUP BY s.id ORDER BY s.name",
+            (parent_id,)
+        ).fetchall()
+
+
+def _bk_shelf_books(shelf_id: int, page: int = 0) -> tuple:
+    """کتێبەکانی ناو بەشێک + کۆی گشتی."""
+    with _bk_db() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM book_shelf_members WHERE shelf_id=?", (shelf_id,)
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT b.id, b.title, b.author, b.language, b.total_pages "
+            "FROM book_shelf_members m JOIN books b ON b.id = m.book_id "
+            "WHERE m.shelf_id=? ORDER BY b.title LIMIT ? OFFSET ?",
+            (shelf_id, _BK_SHELF_PER, page * _BK_SHELF_PER)
+        ).fetchall()
+    return rows, total
+
+
+def _bk_shelf_create(name: str, parent_id, emoji_id: str, created_by: int) -> int:
+    """بەشی نوێ دروست دەکات — id ی نوێ دەگەڕێنێتەوە."""
+    from datetime import datetime as _dt
+    with _bk_db() as c:
+        cur = c.execute(
+            "INSERT INTO book_shelves (name, parent_id, emoji_id, created_by, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (name, parent_id, emoji_id, created_by,
+             _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        return cur.lastrowid
+
+
+def _bk_shelf_delete(shelf_id: int) -> None:
+    """بەش + هەموو ژێربەشەکان دەسڕێتەوە (CASCADE)."""
+    with _bk_db() as c:
+        c.execute("DELETE FROM book_shelves WHERE id=?", (shelf_id,))
+
+
+def _bk_shelf_add_book(shelf_id: int, book_id: int) -> bool:
+    """True = نوێ زیادکرا، False = پێشتر هەبوو."""
+    try:
+        with _bk_db() as c:
+            c.execute(
+                "INSERT INTO book_shelf_members (shelf_id, book_id) VALUES (?,?)",
+                (shelf_id, book_id)
+            )
+        return True
+    except _bk_sqlite.IntegrityError:
+        return False
+
+
+def _bk_shelf_remove_book(shelf_id: int, book_id: int) -> None:
+    with _bk_db() as c:
+        c.execute(
+            "DELETE FROM book_shelf_members WHERE shelf_id=? AND book_id=?",
+            (shelf_id, book_id)
+        )
+
+
+# ── UI Builders ──────────────────────────────────────────────────────────────
+
+def _bk_build_shelf_list(parent_id=None, user_id: int = 0) -> tuple:
+    """لیستی بەشەکان دروست دەکات (سەرەوە یان ژێر parent_id)."""
+    shelves = _bk_shelf_children(parent_id)
+
+    if parent_id is None:
+        header = (
+            f'<tg-emoji emoji-id="{_BK_E_SHELF}">📚</tg-emoji> <b>بەشەکانی کتێبخانە</b>\n'
+            f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+        )
+        back_data  = "bk_list:0"
+        parent_eid = _BK_E_SHELF
+    else:
+        parent = _bk_shelf_get(parent_id)
+        pname  = html.escape(parent["name"]) if parent else "بەش"
+        parent_eid = (parent["emoji_id"] if parent else _BK_E_FOLDER)
+        header = (
+            f'<tg-emoji emoji-id="{parent_eid}">📁</tg-emoji> <b>{pname}</b>\n'
+            f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+        )
+        pp = parent["parent_id"] if parent else None
+        back_data = f"bk_shelves:{pp}" if pp is not None else "bk_shelves:"
+
+    if not shelves:
+        text = header + (
+            f'<tg-emoji emoji-id="5352896944496728039">📭</tg-emoji> '
+            f'هیچ ژێربەشێک نییە.\n'
+        )
+    else:
+        counts = []
+        for s in shelves:
+            cnt = []
+            if s["child_count"]: cnt.append(f'{s["child_count"]} ژێربەش')
+            if s["book_count"]:  cnt.append(f'{s["book_count"]} کتێب')
+            counts.append("  ·  ".join(cnt))
+        text = header
+        for s, cnt in zip(shelves, counts):
+            eid = s["emoji_id"]
+            text += (
+                f'<tg-emoji emoji-id="{eid}">📁</tg-emoji> '
+                f'<b>{html.escape(s["name"])}</b>'
+                + (f'  <i>({cnt})</i>' if cnt else '') + '\n'
+            )
+        text += '\n'
+
+    btns = []
+    for s in shelves:
+        btns.append([_ebtn(s["name"], f"bk_shelf:{s['id']}:0",
+                           emoji_id=s["emoji_id"], api_kwargs={"style": "primary"})])
+
+    new_p = str(parent_id) if parent_id is not None else ""
+    btns.append([_ebtn("بەشی نوێ", f"bk_shelf_new:{new_p}",
+                        emoji_id=_BK_E_ADD, api_kwargs={"style": "success"})])
+    if parent_id is not None:
+        btns.append([_ebtn("سڕینەوەی ئەم بەشە", f"bk_shelf_del_confirm:{parent_id}",
+                            emoji_id=_BK_E_DEL, api_kwargs={"style": "danger"})])
+    btns.append([_ebtn("گەڕانەوە", back_data,
+                        emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"})])
+    return text, InlineKeyboardMarkup(btns)
+
+
+def _bk_build_shelf_view(shelf_id: int, page: int, user_id: int) -> tuple:
+    """کتێبەکانی ناو بەشێک + ژێربەشەکان."""
+    shelf = _bk_shelf_get(shelf_id)
+    if not shelf:
+        return (
+            f'<tg-emoji emoji-id="6271611232457855630">❌</tg-emoji> بەشەکە نەدۆزرایەوە.',
+            InlineKeyboardMarkup([])
+        )
+
+    books, total = _bk_shelf_books(shelf_id, page)
+    subs = _bk_shelf_children(shelf_id)
+    total_pages = max(1, (total + _BK_SHELF_PER - 1) // _BK_SHELF_PER)
+    eid  = shelf["emoji_id"]
+
+    # ── سەردێڕ ──
+    text = (
+        f'<tg-emoji emoji-id="{eid}">📁</tg-emoji> <b>{html.escape(shelf["name"])}</b>\n'
+        f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+    )
+    parts = []
+    if subs:  parts.append(f'{len(subs)} ژێربەش')
+    if total: parts.append(f'{total} کتێب')
+    if parts: text += "  ·  ".join(parts) + "\n\n"
+
+    btns: list = []
+
+    # ── ژێربەشەکان ──
+    for s in subs:
+        cnt = f" ({s['book_count']})" if s["book_count"] else ""
+        btns.append([_ebtn(f"{s['name']}{cnt}", f"bk_shelf:{s['id']}:0",
+                           emoji_id=s["emoji_id"], api_kwargs={"style": "primary"})])
+
+    # ── کتێبەکان ──
+    if books:
+        text += f'<tg-emoji emoji-id="{_BK_E_BOOK}">📖</tg-emoji> <b>کتێبەکان:</b>\n'
+        for b in books:
+            flag = "🌙" if b["language"] == "ar" else ("📖" if b["language"] in ("ku","ckb") else "🌍")
+            text += f'  {flag} {html.escape(b["title"])}\n'
+        text += '\n'
+        for b in books:
+            lbl = (b["title"][:22] + "…") if len(b["title"]) > 24 else b["title"]
+            btns.append([
+                _ebtn(lbl, f"bk_read:{b['id']}:1",
+                      emoji_id=_BK_E_BOOK, api_kwargs={"style": "primary"}),
+                _ebtn("❌", f"bk_shelf_rmbook:{shelf_id}:{b['id']}:{page}",
+                      emoji_id=_BK_E_DEL, api_kwargs={"style": "danger"}),
+            ])
+    elif not subs:
+        text += (
+            f'<tg-emoji emoji-id="5352896944496728039">📭</tg-emoji> '
+            f'هیچ کتێبێک زیادنەکراوە.\n'
+        )
+
+    # ── ناڤیگەیشنی پەڕە ──
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_ebtn("پێشتر", f"bk_shelf:{shelf_id}:{page-1}",
+                             emoji_id=_BK_E_PREV, api_kwargs={"style": "primary"}))
+        nav.append(_ebtn(f"{page+1}/{total_pages}", "bk_noop",
+                         emoji_id=_BK_E_BKMK, api_kwargs={"style": "primary"}))
+        if page < total_pages - 1:
+            nav.append(_ebtn("دواتر", f"bk_shelf:{shelf_id}:{page+1}",
+                             emoji_id=_BK_E_NEXT, api_kwargs={"style": "primary"}))
+        btns.append(nav)
+
+    # ── دووگمەکانی ئاواکردن ──
+    btns.append([
+        _ebtn("ژێربەشی نوێ", f"bk_shelf_new:{shelf_id}",
+              emoji_id=_BK_E_ADD, api_kwargs={"style": "success"}),
+        _ebtn("کتێب زیاد بکە", f"bk_shelf_addbook:{shelf_id}:0",
+              emoji_id=_BK_E_BOOK, api_kwargs={"style": "success"}),
+    ])
+    if user_id == OWNER_ID:
+        btns.append([_ebtn("سڕینەوەی ئەم بەشە", f"bk_shelf_del_confirm:{shelf_id}",
+                            emoji_id=_BK_E_DEL, api_kwargs={"style": "danger"})])
+
+    # ── گەڕانەوە ──
+    pid = shelf["parent_id"]
+    back = f"bk_shelves:{pid}" if pid is not None else "bk_shelves:"
+    btns.append([_ebtn("گەڕانەوە", back,
+                        emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"})])
+    return text, InlineKeyboardMarkup(btns)
+
+
+def _bk_build_addbook_to_shelf(shelf_id: int, page: int) -> tuple:
+    """لیستی کتێبەکانی لەبارنەهێنراو بۆ بەشێک — بۆ زیادکردن."""
+    with _bk_db() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM books b WHERE NOT EXISTS "
+            "(SELECT 1 FROM book_shelf_members m WHERE m.shelf_id=? AND m.book_id=b.id)",
+            (shelf_id,)
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT b.id, b.title, b.language FROM books b WHERE NOT EXISTS "
+            "(SELECT 1 FROM book_shelf_members m WHERE m.shelf_id=? AND m.book_id=b.id) "
+            "ORDER BY b.title LIMIT ? OFFSET ?",
+            (shelf_id, _BK_PER_PAGE, page * _BK_PER_PAGE)
+        ).fetchall()
+
+    shelf  = _bk_shelf_get(shelf_id)
+    sname  = html.escape(shelf["name"]) if shelf else "بەش"
+    tp     = max(1, (total + _BK_PER_PAGE - 1) // _BK_PER_PAGE)
+    text   = (
+        f'<tg-emoji emoji-id="{_BK_E_ADD}">➕</tg-emoji>'
+        f' <b>کتێب زیاد بکە بۆ «{sname}»</b>\n'
+        f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+        f'کتێبی بەردەست: <b>{total}</b>  ·  لاپەڕەی <b>{page+1}/{tp}</b>\n\n'
+    )
+    btns: list = []
+    if not rows:
+        text += (
+            f'<tg-emoji emoji-id="5857044938755149915">✅</tg-emoji> '
+            f'هەموو کتێبەکان زیادکراون.'
+        )
+    for b in rows:
+        flag = "🌙" if b["language"] == "ar" else ("📖" if b["language"] in ("ku","ckb") else "🌍")
+        lbl  = f'{flag} {b["title"][:26]}'
+        btns.append([_ebtn(lbl, f"bk_shelf_addbook_do:{shelf_id}:{b['id']}",
+                           emoji_id=_BK_E_ADD, api_kwargs={"style": "success"})])
+    nav = []
+    if page > 0:
+        nav.append(_ebtn("پێشتر", f"bk_shelf_addbook:{shelf_id}:{page-1}",
+                         emoji_id=_BK_E_PREV, api_kwargs={"style": "primary"}))
+    if page < tp - 1:
+        nav.append(_ebtn("دواتر", f"bk_shelf_addbook:{shelf_id}:{page+1}",
+                         emoji_id=_BK_E_NEXT, api_kwargs={"style": "primary"}))
+    if nav:
+        btns.append(nav)
+    btns.append([_ebtn("گەڕانەوە", f"bk_shelf:{shelf_id}:0",
+                        emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"})])
+    return text, InlineKeyboardMarkup(btns)
+
+
+def _bk_build_addbookto_shelf(book_id: int, page: int) -> tuple:
+    """لیستی بەشەکان بۆ زیادکردنی کتێبێکی دیاریکراو بۆ بەش — لە reader."""
+    with _bk_db() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM book_shelves s WHERE NOT EXISTS "
+            "(SELECT 1 FROM book_shelf_members m WHERE m.shelf_id=s.id AND m.book_id=?)",
+            (book_id,)
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT s.id, s.name, s.emoji_id FROM book_shelves s WHERE NOT EXISTS "
+            "(SELECT 1 FROM book_shelf_members m WHERE m.shelf_id=s.id AND m.book_id=?) "
+            "ORDER BY s.name LIMIT ? OFFSET ?",
+            (book_id, _BK_PER_PAGE, page * _BK_PER_PAGE)
+        ).fetchall()
+        book = c.execute("SELECT title FROM books WHERE id=?", (book_id,)).fetchone()
+
+    btitle = html.escape(book["title"][:30]) if book else "کتێب"
+    tp     = max(1, (total + _BK_PER_PAGE - 1) // _BK_PER_PAGE)
+    text   = (
+        f'<tg-emoji emoji-id="{_BK_E_SHELF}">📚</tg-emoji>'
+        f' <b>زیادکردن بۆ بەش</b>\n'
+        f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+        f'کتێب: <b>{btitle}</b>\n'
+        f'بەشی بەردەست: <b>{total}</b>  ·  لاپەڕەی <b>{page+1}/{tp}</b>\n\n'
+    )
+    btns: list = []
+    if not rows:
+        text += (
+            f'<tg-emoji emoji-id="5857044938755149915">✅</tg-emoji> '
+            f'ئەم کتێبە لە هەموو بەشەکاندایە.'
+        )
+    for s in rows:
+        btns.append([_ebtn(s["name"], f"bk_shelf_addbookto_do:{book_id}:{s['id']}",
+                           emoji_id=s["emoji_id"], api_kwargs={"style": "success"})])
+    nav = []
+    if page > 0:
+        nav.append(_ebtn("پێشتر", f"bk_shelf_addbookto:{book_id}:{page-1}",
+                         emoji_id=_BK_E_PREV, api_kwargs={"style": "primary"}))
+    if page < tp - 1:
+        nav.append(_ebtn("دواتر", f"bk_shelf_addbookto:{book_id}:{page+1}",
+                         emoji_id=_BK_E_NEXT, api_kwargs={"style": "primary"}))
+    if nav:
+        btns.append(nav)
+    btns.append([_ebtn("گەڕانەوە", f"bk_read:{book_id}:1",
+                        emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"})])
+    return text, InlineKeyboardMarkup(btns)
+
+
+def _bk_build_emoji_picker(name: str, parent_id) -> tuple:
+    """هەڵبژاردنی ئیمۆجی کاتی دروستکردنی بەشی نوێ."""
+    pstr = html.escape(str(parent_id)) if parent_id is not None else "سەرەوە"
+    text = (
+        f'<tg-emoji emoji-id="{_BK_E_ADD}">➕</tg-emoji>'
+        f' <b>ئیمۆجی هەڵبژێرە بۆ «{html.escape(name)}»</b>\n'
+        f'⊱━━━━━<tg-emoji emoji-id="{_BK_E_STAR}">⭐</tg-emoji>━━━━━⊰\n\n'
+    )
+    pid = str(parent_id) if parent_id is not None else ""
+    rows = []
+    row  = []
+    for i, (eid, lbl) in enumerate(_BK_SHELF_EMOJIS):
+        row.append(_ebtn(lbl, f"bk_shelf_emoji:{pid}:{eid}:{name}",
+                         emoji_id=eid, api_kwargs={"style": "primary"}))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([_ebtn("هەڵبوەشێنەرەوە", "bk_shelf_cancel",
+                        emoji_id=_BK_E_BACK, api_kwargs={"style": "danger"})])
+    return text, InlineKeyboardMarkup(rows)
 
 
 def _bk_save_progress(user_id: int, book_id: int, page_num: int) -> None:
@@ -6211,9 +6611,10 @@ def _bk_build_list(page: int, user_id: int) -> tuple:
         btns.append(nav)
 
     # هەموو میمبەرەکان دەتوانن کتێب زیاد بکەن
-    btns.append([_ebtn("زیادکردنی کتێب", "bk_add", emoji_id=_BK_E_ADD,
-                       api_kwargs={"style": "success"})])
-
+    btns.append([
+        _ebtn("بەشەکان", "bk_shelves:", emoji_id=_BK_E_SHELF, api_kwargs={"style": "primary"}),
+        _ebtn("زیادکردنی کتێب", "bk_add", emoji_id=_BK_E_ADD, api_kwargs={"style": "success"}),
+    ])
     btns.append([_ebtn("گەڕانەوە", "menu:islamic", emoji_id=_BK_E_BACK,
                        api_kwargs={"style": "primary"})])
     return text, InlineKeyboardMarkup(btns)
@@ -6340,6 +6741,8 @@ def _bk_build_reader(book_id: int, page_num: int, user_id: int,
                 api_kwargs={"style": "success"},
             )])
 
+    rows.append([_ebtn("زیادکردن بۆ بەش", f"bk_shelf_addbookto:{book_id}:0",
+                        emoji_id=_BK_E_SHELF, api_kwargs={"style": "success"})])
     bottom = [_ebtn("لیستی کتێب", "bk_list:0", emoji_id=_BK_E_LIST,
                     api_kwargs={"style": "primary"})]
     if user_id == OWNER_ID:
@@ -6633,6 +7036,223 @@ async def _bk_del_callback(query, context):
     await _safe_edit(query, "<tg-emoji emoji-id='5857044938755149915'>✅</tg-emoji> کتێبەکە سڕایەوە.\n\n" + text, reply_markup=kb)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Shelf Callbacks
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _bk_shelves_callback(query, context) -> None:
+    """لیستی بەشەکان (سەرەوە یان ژێربەش)."""
+    parts     = query.data.split(":")
+    parent_id = None
+    if len(parts) > 1 and parts[1]:
+        try: parent_id = int(parts[1])
+        except ValueError: pass
+    loop = asyncio.get_running_loop()
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_shelf_list, parent_id, query.from_user.id
+    )
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_callback(query, context) -> None:
+    """ناوەکانی بەشێک."""
+    parts = query.data.split(":")
+    try:
+        shelf_id = int(parts[1])
+        page     = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+    loop = asyncio.get_running_loop()
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_shelf_view, shelf_id, page, query.from_user.id
+    )
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_new_callback(query, context) -> None:
+    """دەستپێکردنی دروستکردنی بەشی نوێ — داوای ناو دەکات."""
+    parts     = query.data.split(":")
+    parent_id = None
+    if len(parts) > 1 and parts[1]:
+        try: parent_id = int(parts[1])
+        except ValueError: pass
+
+    uid = query.from_user.id
+    import time as _t
+    _BK_SHELF_WAIT[uid] = {"step": "name", "parent_id": parent_id, "_ts": _t.monotonic()}
+
+    pname = ""
+    if parent_id is not None:
+        p = await asyncio.get_running_loop().run_in_executor(None, _bk_shelf_get, parent_id)
+        if p: pname = f'\nژێر: <b>{html.escape(p["name"])}</b>'
+
+    kb = InlineKeyboardMarkup([[
+        _ebtn("هەڵبوەشێنەرەوە", "bk_shelf_cancel",
+              emoji_id=_BK_E_BACK, api_kwargs={"style": "danger"})
+    ]])
+    await _safe_edit(
+        query,
+        f'<tg-emoji emoji-id="{_BK_E_ADD}">➕</tg-emoji> <b>بەشی نوێ</b>{pname}\n\n'
+        f'ناوی بەشەکە بنووسە:\n<i>نمونە: فەیلەسووفەکان</i>',
+        reply_markup=kb,
+    )
+
+
+async def _bk_shelf_emoji_callback(query, context) -> None:
+    """ئیمۆجی هەڵبژێردرا — بەش دروست دەکات."""
+    # data = bk_shelf_emoji:{parent_id}:{emoji_id}:{name}
+    parts = query.data.split(":", 4)
+    if len(parts) < 4:
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+    parent_id = int(parts[1]) if parts[1] else None
+    emoji_id  = parts[2]
+    name      = parts[3]
+    uid       = query.from_user.id
+
+    loop     = asyncio.get_running_loop()
+    shelf_id = await loop.run_in_executor(
+        None, _bk_shelf_create, name, parent_id, emoji_id, uid
+    )
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_shelf_view, shelf_id, 0, uid
+    )
+    await query.answer(f"✅ «{name}» دروستکرا!")
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_del_confirm_callback(query, context) -> None:
+    """پشتڕاستکردنی سڕینەوەی بەش."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔", show_alert=True); return
+    try: shelf_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+
+    shelf = await asyncio.get_running_loop().run_in_executor(None, _bk_shelf_get, shelf_id)
+    if not shelf:
+        await query.answer("نەدۆزرایەوە", show_alert=True); return
+
+    kb = InlineKeyboardMarkup([[
+        _ebtn("✅ بەڵێ، بسڕەوە", f"bk_shelf_del:{shelf_id}",
+              emoji_id=_BK_E_DEL, api_kwargs={"style": "danger"}),
+        _ebtn("❌ نەخێر", f"bk_shelf:{shelf_id}:0",
+              emoji_id=_BK_E_BACK, api_kwargs={"style": "primary"}),
+    ]])
+    await _safe_edit(
+        query,
+        f'<tg-emoji emoji-id="{_BK_E_DEL}">🗑</tg-emoji> <b>دڵنیای لە سڕینەوەی بەش؟</b>\n\n'
+        f'<b>{html.escape(shelf["name"])}</b>\n\n'
+        f'<i>هەموو ژێربەشەکانیش دەسڕێنەوە!</i>',
+        reply_markup=kb,
+    )
+
+
+async def _bk_shelf_del_callback(query, context) -> None:
+    """سڕینەوەی بەش."""
+    if query.from_user.id != OWNER_ID:
+        await query.answer("⛔", show_alert=True); return
+    try: shelf_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+
+    loop  = asyncio.get_running_loop()
+    shelf = await loop.run_in_executor(None, _bk_shelf_get, shelf_id)
+    if not shelf:
+        await query.answer("نەدۆزرایەوە", show_alert=True); return
+
+    pid  = shelf["parent_id"]
+    name = shelf["name"]
+    await loop.run_in_executor(None, _bk_shelf_delete, shelf_id)
+    await query.answer(f"🗑 «{name}» سڕایەوە")
+
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_shelf_list, pid, query.from_user.id
+    )
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_addbook_callback(query, context) -> None:
+    """لیستی کتێبەکانی بەردەست بۆ زیادکردن بۆ بەش."""
+    parts = query.data.split(":")
+    try:
+        shelf_id = int(parts[1])
+        page     = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+    loop = asyncio.get_running_loop()
+    text, kb = await loop.run_in_executor(None, _bk_build_addbook_to_shelf, shelf_id, page)
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_addbook_do_callback(query, context) -> None:
+    """کتێب زیاد دەکات بۆ بەش."""
+    parts = query.data.split(":")
+    try:
+        shelf_id = int(parts[1])
+        book_id  = int(parts[2])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+
+    loop  = asyncio.get_running_loop()
+    added = await loop.run_in_executor(None, _bk_shelf_add_book, shelf_id, book_id)
+    await query.answer("✅ زیادکرا!" if added else "ℹ️ پێشتر زیادکراوە")
+    text, kb = await loop.run_in_executor(None, _bk_build_addbook_to_shelf, shelf_id, 0)
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_rmbook_callback(query, context) -> None:
+    """کتێب لە بەش دەسڕێتەوە."""
+    parts = query.data.split(":")
+    try:
+        shelf_id = int(parts[1])
+        book_id  = int(parts[2])
+        page     = int(parts[3]) if len(parts) > 3 else 0
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _bk_shelf_remove_book, shelf_id, book_id)
+    await query.answer("🗑 لادرا")
+    text, kb = await loop.run_in_executor(
+        None, _bk_build_shelf_view, shelf_id, page, query.from_user.id
+    )
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_addbookto_callback(query, context) -> None:
+    """لیستی بەشەکان بۆ زیادکردنی کتێبێک (لە reader)."""
+    parts = query.data.split(":")
+    try:
+        book_id = int(parts[1])
+        page    = int(parts[2]) if len(parts) > 2 and parts[2] else 0
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+    loop = asyncio.get_running_loop()
+    text, kb = await loop.run_in_executor(None, _bk_build_addbookto_shelf, book_id, page)
+    await _safe_edit(query, text, reply_markup=kb)
+
+
+async def _bk_shelf_addbookto_do_callback(query, context) -> None:
+    """کتێب زیاد دەکات بۆ بەشی هەڵبژێردراو (لە reader)."""
+    parts = query.data.split(":")
+    try:
+        book_id  = int(parts[1])
+        shelf_id = int(parts[2])
+    except (ValueError, IndexError):
+        await query.answer("⚠️ داتای خراپ", show_alert=True); return
+
+    loop  = asyncio.get_running_loop()
+    added = await loop.run_in_executor(None, _bk_shelf_add_book, shelf_id, book_id)
+    if added:
+        shelf = await loop.run_in_executor(None, _bk_shelf_get, shelf_id)
+        sname = shelf["name"] if shelf else "بەش"
+        await query.answer(f"✅ زیادکرا بۆ «{sname}»!")
+    else:
+        await query.answer("ℹ️ پێشتر زیادکراوە")
+    text, kb = await loop.run_in_executor(None, _bk_build_addbookto_shelf, book_id, 0)
+    await _safe_edit(query, text, reply_markup=kb)
+
+
 async def book_callback(update, context):
     """دیسپاچەری سەرەکی بۆ هەموو bk_ کالبەکەکان."""
     query = update.callback_query
@@ -6648,14 +7268,35 @@ async def book_callback(update, context):
     #   — _safe_edit خۆکار answer دەکات بۆ کەیسە ئاساییەکان
     #   — non-owner check لە هەر sub-callback خۆی show_alert=True دەکات
 
-    if   data.startswith("bk_list:"):         await _bk_list_callback(query, context)
-    elif data.startswith("bk_read:"):         await _bk_read_callback(query, context)
-    elif data.startswith("bk_trans:"):        await _bk_trans_callback(query, context)
-    elif data == "bk_add":                    await _bk_add_callback(query, context)
-    elif data.startswith("bk_setlang:"):      await _bk_setlang_callback(query, context)
-    elif data.startswith("bk_del_confirm:"):  await _bk_del_confirm_callback(query, context)
-    elif data.startswith("bk_del:"):          await _bk_del_callback(query, context)
-    elif data.startswith("bk_chunk:"):        await _bk_chunk_continue_callback(query, context)
+    if   data.startswith("bk_list:"):              await _bk_list_callback(query, context)
+    elif data.startswith("bk_read:"):              await _bk_read_callback(query, context)
+    elif data.startswith("bk_trans:"):             await _bk_trans_callback(query, context)
+    elif data == "bk_add":                         await _bk_add_callback(query, context)
+    elif data.startswith("bk_setlang:"):           await _bk_setlang_callback(query, context)
+    elif data.startswith("bk_del_confirm:"):       await _bk_del_confirm_callback(query, context)
+    elif data.startswith("bk_del:"):               await _bk_del_callback(query, context)
+    elif data.startswith("bk_chunk:"):             await _bk_chunk_continue_callback(query, context)
+    # ── Shelf System ────────────────────────────────────────────────────────
+    elif data.startswith("bk_shelves"):            await _bk_shelves_callback(query, context)
+    elif data.startswith("bk_shelf:"):             await _bk_shelf_callback(query, context)
+    elif data.startswith("bk_shelf_new:"):         await _bk_shelf_new_callback(query, context)
+    elif data.startswith("bk_shelf_emoji:"):       await _bk_shelf_emoji_callback(query, context)
+    elif data.startswith("bk_shelf_del_confirm:"): await _bk_shelf_del_confirm_callback(query, context)
+    elif data.startswith("bk_shelf_del:"):         await _bk_shelf_del_callback(query, context)
+    elif data.startswith("bk_shelf_addbook:"):     await _bk_shelf_addbook_callback(query, context)
+    elif data.startswith("bk_shelf_addbook_do:"): await _bk_shelf_addbook_do_callback(query, context)
+    elif data.startswith("bk_shelf_rmbook:"):      await _bk_shelf_rmbook_callback(query, context)
+    elif data.startswith("bk_shelf_addbookto:"):   await _bk_shelf_addbookto_callback(query, context)
+    elif data.startswith("bk_shelf_addbookto_do:"): await _bk_shelf_addbookto_do_callback(query, context)
+    elif data == "bk_shelf_cancel":
+        _BK_SHELF_WAIT.pop(query.from_user.id, None)
+        await query.answer("❌ هەڵبوەشێنرایەوە")
+        loop = asyncio.get_running_loop()
+        text, kb = await loop.run_in_executor(
+            None, _bk_build_shelf_list, None, query.from_user.id
+        )
+        await _safe_edit(query, text, reply_markup=kb)
+    # ────────────────────────────────────────────────────────────────────────
     elif data == "bk_cancel":
         _BK_WAIT.pop(query.from_user.id, None)
         await query.answer("❌ هەڵبوەشێنرایەوە", show_alert=False)
@@ -6687,6 +7328,26 @@ async def bk_message_handler(update, context):
     uid     = user.id
     chat_id = msg.chat_id
     state   = _BK_WAIT.get(uid)
+
+    # ══ ناوی بەشی نوێ ════════════════════════════════════════════════════════
+    shelf_state = _BK_SHELF_WAIT.get(uid)
+    if shelf_state and shelf_state.get("step") == "name":
+        import time as _bk_st
+        if _bk_st.monotonic() - shelf_state["_ts"] > 300.0:
+            _BK_SHELF_WAIT.pop(uid, None)
+        elif msg.text:
+            name = msg.text.strip()
+            if not name:
+                await msg.reply_text("⚠️ ناوەکە بەتاڵە.", parse_mode="HTML"); return
+            if len(name) > 60:
+                await msg.reply_text("⚠️ ناوەکە زۆر درێژە (زیاتر لە ٦٠ پیت).", parse_mode="HTML"); return
+            # step → emoji picker
+            shelf_state["step"] = "emoji"
+            shelf_state["name"] = name
+            shelf_state["_ts"]  = _bk_st.monotonic()
+            text, kb = _bk_build_emoji_picker(name, shelf_state["parent_id"])
+            await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+            return
 
     # ══ ڕاستەوخۆ: PDF نێردرا بێ state ══════════════════════════════════════
     # کاتێک میمبەر PDF دەنێرێت بێ ئەوەی بووگمەکەی دابەستبێت
